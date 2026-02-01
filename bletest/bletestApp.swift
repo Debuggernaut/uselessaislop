@@ -1,10 +1,40 @@
 import SwiftUI
 import CoreBluetooth
-import Combine   // ← Add this import
+import Combine
 
 #if os(iOS)
 import UIKit
 #endif
+
+#if os(macOS)
+
+import AppKit
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return true
+    }
+}
+#endif
+
+#if os(visionOS)
+#endif
+
+struct DiscoveredDevice: Identifiable {
+    let uuid: UUID
+    var id: UUID { uuid }
+    var peripheralName: String
+    var advertisedLocalName: String
+    var rssi: NSNumber
+    
+    var shortID: String {
+        String(uuid.uuidString.prefix(8)).uppercased() + "..."
+    }
+    
+    var rssiValue: Int {
+        rssi.intValue
+    }
+}
 
 class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralManagerDelegate {
     let serviceUUID = CBUUID(string: "54EF7F90-A3EA-423A-8D6D-56FF28DE238A")
@@ -19,7 +49,11 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
         }
     }
     
-    private var lastReceived: [UUID: String] = [:]
+    @Published private var discoveredDevicesMap: [UUID: DiscoveredDevice] = [:]
+    
+    var discoveredDevices: [DiscoveredDevice] {
+        discoveredDevicesMap.values.sorted { $0.rssiValue > $1.rssiValue }
+    }
     
     private var deviceName: String {
 #if os(iOS)
@@ -41,34 +75,28 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
     }
     
     private func updateAdvertising() {
-        // Only advertise if Bluetooth is powered on
-        
         receivedMessages.append("updateAdvertising(), state: \(peripheralManager.state)")
         guard peripheralManager.state == .poweredOn else { return }
         
         peripheralManager.stopAdvertising()
         
         guard let data = currentMessage.data(using: .utf8), !data.isEmpty else { return }
-        
-        let advertisementData: [String: Any] = [
-            CBAdvertisementDataServiceUUIDsKey: [serviceUUID],
-            CBAdvertisementDataLocalNameKey: currentMessage
-        ]
-        
+
         receivedMessages.append("startAdvertising(), adv: \(currentMessage)")
-        peripheralManager.startAdvertising(advertisementData)
+        peripheralManager.startAdvertising([CBAdvertisementDataServiceUUIDsKey: [serviceUUID],
+                                               CBAdvertisementDataLocalNameKey: currentMessage])
     }
     
-    // MARK: - CBPeripheralManagerDelegate
+    // MARK: - CBPeripheralManagerDelegate (send)
     
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
         receivedMessages.append("peripheralManagerDidUpdateState(), peripheral.state: \(peripheral.state)")
         if peripheral.state == .poweredOn {
-            updateAdvertising() // Ensure we advertise the current message once powered on
+            updateAdvertising()
         }
     }
     
-    // MARK: - CBCentralManagerDelegate
+    // MARK: - CBCentralManagerDelegate (receive)
     
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         receivedMessages.append("centralManagerDidUpdateState(), central.state: \(central.state)")
@@ -80,42 +108,73 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
             )
         }
     }
+    
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
         // Print raw discovery info and ALL advertisement values to console (for full debugging)
         let senderName = peripheral.name ?? "Unknown Device"
         let shortID = String(peripheral.identifier.uuidString.prefix(8))
-        print("=== DISCOVERED PERIPHERAL ===")
-        print("Name: \(senderName)")
-        print("ID (short): \(shortID)...")
-        print("Full ID: \(peripheral.identifier.uuidString)")
-        print("RSSI: \(RSSI) dBm")
-        print("Full advertisementData: \(advertisementData)")
-        print("==============================")
         
-        // Optional: still show basic activity in UI even if no message
-        let advertisedLocalName = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? "(none)"
-        receivedMessages.append("Discovered \(senderName) (\(shortID)...) – RSSI \(RSSI) dBm, advData: \(advertisedLocalName)")
+        let uuid = peripheral.identifier
+        let advertisedLocalName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "(none)"
         
-        guard let serviceDataDict = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data],
-              let data = serviceDataDict[serviceUUID],
-              let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !message.isEmpty else {
-            print("No valid message data found in this advertisement.")
-            return
+        var updated = false
+        
+        // Update or create discovered device entry (always, even if no message)
+        if var device = discoveredDevicesMap[uuid] {
+            if (senderName != device.peripheralName
+            || advertisedLocalName != device.advertisedLocalName)
+            {
+                updated = true;
+            }
+            
+            device.peripheralName = senderName
+            device.advertisedLocalName = advertisedLocalName
+            device.rssi = RSSI
+            discoveredDevicesMap[uuid] = device
+        } else {
+            let newDevice = DiscoveredDevice(
+                uuid: uuid,
+                peripheralName: senderName,
+                advertisedLocalName: advertisedLocalName,
+                rssi: RSSI
+            )
+            discoveredDevicesMap[uuid] = newDevice
+            updated = true
         }
         
-        // We have a valid message → log it EVERY time (no deduping, so you see all repeats)
-        let time = Date().formatted(date: .omitted, time: .shortened)
-        let entry = "\(time) | \(message) | from \(senderName) (\(shortID)...) | RSSI \(RSSI) dBm"
-        
-        receivedMessages.append(entry)
-        print("RECEIVED MESSAGE: \(entry)")
+        if (updated)
+        {
+            print("=== DISCOVERED PERIPHERAL ===")
+            print("Name: \(senderName)")
+            print("ID (short): \(shortID)...")
+            print("Full ID: \(peripheral.identifier.uuidString)")
+            print("RSSI: \(RSSI) dBm")
+            print("Full advertisementData: \(advertisementData)")
+            print("==============================")
+            
+            // Treat advertised local name as the broadcast message (since that's what we advertise)
+            var message: String?
+            if advertisedLocalName != "(none)" {
+                message = advertisedLocalName.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            
+            if let message = message, !message.isEmpty {
+                let time = Date().formatted(date: .omitted, time: .shortened)
+                let entry = "\(time) | \(message) | from \(senderName) (\(shortID)...) | RSSI \(RSSI) dBm"
+                receivedMessages.append(entry)
+                print("RECEIVED MESSAGE: \(entry)")
+            }
+        }
     }
 }
 
 @main
 struct BLEBroadcastApp: App {
     @StateObject private var bleManager = BLEManager()
+    
+    #if os(macOS)
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    #endif
     
     var body: some Scene {
         WindowGroup {
@@ -130,76 +189,136 @@ struct ContentView: View {
     
     @State private var inputText: String = ""
     
-    // Computed property: validates in real-time as the user types
+    private var trimmedInput: String {
+        inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private var isValidMessage: Bool {
-        let trimmed = inputText.trimmingCharacters(in: .whitespaces)
-        let count = trimmed.count
-        return count >= 6 && count <= 12
+        !trimmedInput.isEmpty && trimmedInput.utf8.count <= 28
+    }
+
+    private var needsUpdate: Bool {
+        trimmedInput != bleManager.currentMessage
     }
     
+    private var buttonTitle: String {
+        if !isValidMessage {
+            return "Invalid Message"
+        }
+        if bleManager.currentMessage.isEmpty {
+            return "Broadcast"
+        }
+        if needsUpdate {
+            return "Update Message"
+        }
+        return "Broadcasting..."
+    }
+
     var body: some View {
         VStack(spacing: 20) {
-            Text("BLE Broadcast Messenger")
+            Text("MeetOOMF BLE Broadcast Messenger")
                 .font(.title)
                 .padding(.top)
             
             HStack {
-                TextField("6-12 char message", text: $inputText)
+                TextField("Message to broadcast", text: $inputText)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
                 
-                
-                Button("Broadcast") {
-                    // Runs only on tap
-                    let trimmed = inputText.trimmingCharacters(in: .whitespaces)
-                    let count = trimmed.count
-                    
-                    if count >= 6 && count <= 12 {
-                        bleManager.currentMessage = trimmed
-                    }
-                    // Optional: clear field after sending
-                    // inputText = ""
+                Button(buttonTitle) {
+                    bleManager.currentMessage = trimmedInput
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!isValidMessage)  // Disabled if length is wrong
+                .disabled(!isValidMessage || !needsUpdate)
             }
             .padding(.horizontal)
             
             if !bleManager.currentMessage.isEmpty {
-                Text("Will broadcast: \"\(bleManager.currentMessage)\"")
+                Text("Broadcasting: \"\(bleManager.currentMessage)\"")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
             
-            // Received messages log (newest at bottom)
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(Array(bleManager.receivedMessages.enumerated()), id: \.offset) { offset, message in
-                            Text(message)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .background(Color.secondary.opacity(0.15))
-                                .cornerRadius(8)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(offset)
+            HStack(spacing: 0) {
+                // Left panel: Received messages
+                VStack(alignment: .leading) {
+                    Text("Received Messages")
+                        .font(.headline)
+                        .padding()
+                    
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 8) {
+                                ForEach(Array(bleManager.receivedMessages.enumerated()), id: \.offset) { offset, message in
+                                    Text(message)
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 8)
+                                        .background(Color.secondary.opacity(0.15))
+                                        .cornerRadius(8)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .id(offset)
+                                }
+                            }
+                            .padding()
+                        }
+                        .onChange(of: bleManager.receivedMessages.count, initial: true, {oldCount, newCount in
+                            if newCount > 0 {
+                                withAnimation {
+                                    proxy.scrollTo(newCount - 1, anchor: .bottom)
+                                }
+                            }
+                        })
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                
+                Divider()
+                
+                // Right panel: Discovered devices
+                VStack(alignment: .leading) {
+                    Text("Discovered Devices")
+                        .font(.headline)
+                        .padding()
+                    
+                    List {
+                        if bleManager.discoveredDevices.isEmpty {
+                            Text("No devices discovered yet")
+                                .foregroundColor(.secondary)
+                                .italic()
+                        } else {
+                            ForEach(bleManager.discoveredDevices) { device in
+                                DisclosureGroup {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text("Device Name: \(device.peripheralName)")
+                                        Text("UUID: \(device.uuid.uuidString)")
+                                        Text("RSSI: \(device.rssiValue) dBm")
+                                        Text("Advertised Local Name: \(device.advertisedLocalName)")
+                                    }
+                                    .padding(.leading, 8)
+                                } label: {
+                                    HStack {
+                                        if device.advertisedLocalName == "(none)" || device.advertisedLocalName.isEmpty {
+                                            Text("Unknown Device (\(device.shortID))")
+                                        } else {
+                                            Text(device.advertisedLocalName)
+                                        }
+                                        Spacer()
+                                        Text("\(device.rssiValue) dBm")
+                                            .monospacedDigit()
+                                            .foregroundColor(device.rssiValue > -70 ? .green : (device.rssiValue > -90 ? .orange : .red))
+                                    }
+                                }
+                            }
                         }
                     }
-                    .padding()
+                    .listStyle(.plain)
                 }
-                .onChange(of: bleManager.receivedMessages.count) { newCount in
-                    if newCount > 0 {
-                        withAnimation {
-                            proxy.scrollTo(newCount - 1, anchor: .bottom)
-                        }
-                    }
-                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            
-            Spacer()
+            .frame(maxHeight: .infinity)
         }
+        .padding()
         .onAppear {
-            // Default to a relatively unique 12-character string (new UUID prefix each launch)
             if inputText.isEmpty {
                 let uniquePrefix = String(UUID().uuidString.prefix(12)).uppercased()
                 inputText = uniquePrefix
