@@ -45,9 +45,13 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
     @Published var receivedMessages: [String] = []
     @Published var currentMessage: String = "" {
         didSet {
-            updateAdvertising()
+            Task { await updateAdvertising() }
         }
     }
+    
+    //Update this when we update startAdvertising, just in case someone slips in
+    //a new message while updating the old one
+    var activeMessage: String = ""
     
     @Published private var discoveredDevicesMap: [UUID: DiscoveredDevice] = [:]
     
@@ -74,25 +78,35 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
         receivedMessages.append("-init()")
     }
     
-    private func updateAdvertising() {
+    // MARK: - CBPeripheralManagerDelegate (send)
+    
+    private func updateAdvertising() async {
         receivedMessages.append("updateAdvertising(), state: \(peripheralManager.state)")
         guard peripheralManager.state == .poweredOn else { return }
         
         peripheralManager.stopAdvertising()
-        
-        guard let data = currentMessage.data(using: .utf8), !data.isEmpty else { return }
 
-        receivedMessages.append("startAdvertising(), adv: \(currentMessage)")
-        peripheralManager.startAdvertising([CBAdvertisementDataServiceUUIDsKey: [serviceUUID],
-                                               CBAdvertisementDataLocalNameKey: currentMessage])
+        do {
+            try await Task.sleep(for: .seconds(3))
+            if (activeMessage != currentMessage)
+            {
+                receivedMessages.append("for reals now updateAdvertising(), currentMessage: \(currentMessage)")
+                activeMessage = currentMessage
+                
+                receivedMessages.append("startAdvertising(), adv: \(currentMessage)")
+                peripheralManager.startAdvertising([CBAdvertisementDataServiceUUIDsKey: [serviceUUID],
+                                                       CBAdvertisementDataLocalNameKey: currentMessage])
+            }
+        } catch {
+            //Task throws CancellationError if it exits early
+            return
+        }
     }
-    
-    // MARK: - CBPeripheralManagerDelegate (send)
     
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
         receivedMessages.append("peripheralManagerDidUpdateState(), peripheral.state: \(peripheral.state)")
         if peripheral.state == .poweredOn {
-            updateAdvertising()
+            Task { await updateAdvertising() }
         }
     }
     
@@ -116,6 +130,15 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
         
         let uuid = peripheral.identifier
         let advertisedLocalName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "(none)"
+
+        print("=== DISCOVERED PERIPHERAL ===")
+        print("Name: \(senderName)")
+        print("advertisedLocalName: \(advertisedLocalName)")
+        print("ID (short): \(shortID)...")
+        print("Full ID: \(peripheral.identifier.uuidString)")
+        print("RSSI: \(RSSI) dBm")
+        print("Full advertisementData: \(advertisementData)")
+        print("==============================")
         
         var updated = false
         
@@ -153,6 +176,8 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
             print("==============================")
             
             // Treat advertised local name as the broadcast message (since that's what we advertise)
+            //TODO: DE SLOP THIS
+            //"message" has the right value if it's short, advertisementData if it's long (from a device)
             var message: String?
             if advertisedLocalName != "(none)" {
                 message = advertisedLocalName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -226,6 +251,8 @@ struct ContentView: View {
                     .autocorrectionDisabled()
                 
                 Button(buttonTitle) {
+                    // Updates the message we're sending out, bleManager will automatically pick the new message up
+                    // and call startAdvertising with it
                     bleManager.currentMessage = trimmedInput
                 }
                 .buttonStyle(.borderedProminent)
@@ -320,7 +347,7 @@ struct ContentView: View {
         .padding()
         .onAppear {
             if inputText.isEmpty {
-                let uniquePrefix = String(UUID().uuidString.prefix(12)).uppercased()
+                let uniquePrefix = String(UUID().uuidString.prefix(4)).uppercased()
                 inputText = uniquePrefix
                 bleManager.currentMessage = uniquePrefix
             }
