@@ -84,8 +84,9 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
         
         peripheralManager.stopAdvertising()
 
-        do {
-            try await Task.sleep(for: .seconds(3))
+//        do {
+            //did this to try and see if the iPad would work, but it didn't help
+            //try await Task.sleep(for: .seconds(0.1))
             if (activeMessage != currentMessage)
             {
                 receivedMessages.append("for reals now updateAdvertising(), currentMessage: \(currentMessage)")
@@ -95,10 +96,10 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
                 peripheralManager.startAdvertising([CBAdvertisementDataServiceUUIDsKey: [serviceUUID],
                                                        CBAdvertisementDataLocalNameKey: currentMessage])
             }
-        } catch {
-            //Task throws CancellationError if it exits early
-            return
-        }
+//        } catch {
+//            //Task throws CancellationError if it exits early
+//            return
+//        }
     }
     
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
