@@ -53,11 +53,9 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
     //a new message while updating the old one
     var activeMessage: String = ""
     
-    @Published private var discoveredDevicesMap: [UUID: DiscoveredDevice] = [:]
-    
-    var discoveredDevices: [DiscoveredDevice] {
-        discoveredDevicesMap.values.sorted { $0.rssiValue > $1.rssiValue }
-    }
+    @Published var discoveredDevices: [DiscoveredDevice] = []  // This is now the source of truth for ordering + data
+
+    private var deviceIndices: [UUID: Int] = [:]  // Fast O(1) lookup: UUID → array index
     
     private var deviceName: String {
 #if os(iOS)
@@ -130,42 +128,34 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
         
         let uuid = peripheral.identifier
         let advertisedLocalName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "(none)"
-
-        print("=== DISCOVERED PERIPHERAL ===")
-        print("Name: \(senderName)")
-        print("advertisedLocalName: \(advertisedLocalName)")
-        print("ID (short): \(shortID)...")
-        print("Full ID: \(peripheral.identifier.uuidString)")
-        print("RSSI: \(RSSI) dBm")
-        print("Full advertisementData: \(advertisementData)")
-        print("==============================")
         
-        var updated = false
+        var gotMessage = false
         
-        // Update or create discovered device entry (always, even if no message)
-        if var device = discoveredDevicesMap[uuid] {
-            if (senderName != device.peripheralName
-            || advertisedLocalName != device.advertisedLocalName)
+        if let index = deviceIndices[uuid] {
+            if (senderName != discoveredDevices[index].peripheralName
+            || advertisedLocalName != discoveredDevices[index].advertisedLocalName)
             {
-                updated = true;
+                gotMessage = true;
             }
             
-            device.peripheralName = senderName
-            device.advertisedLocalName = advertisedLocalName
-            device.rssi = RSSI
-            discoveredDevicesMap[uuid] = device
+            discoveredDevices[index].peripheralName = senderName
+            discoveredDevices[index].advertisedLocalName = advertisedLocalName
+            discoveredDevices[index].rssi = RSSI
+            
         } else {
+            // Brand-new device → append to bottom
             let newDevice = DiscoveredDevice(
                 uuid: uuid,
                 peripheralName: senderName,
                 advertisedLocalName: advertisedLocalName,
                 rssi: RSSI
             )
-            discoveredDevicesMap[uuid] = newDevice
-            updated = true
+            discoveredDevices.append(newDevice)
+            deviceIndices[uuid] = discoveredDevices.count - 1
+            gotMessage = true
         }
         
-        if (updated)
+        if (gotMessage)
         {
             print("=== DISCOVERED PERIPHERAL ===")
             print("Name: \(senderName)")
@@ -175,9 +165,6 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
             print("Full advertisementData: \(advertisementData)")
             print("==============================")
             
-            // Treat advertised local name as the broadcast message (since that's what we advertise)
-            //TODO: DE SLOP THIS
-            //"message" has the right value if it's short, advertisementData if it's long (from a device)
             var message: String?
             if advertisedLocalName != "(none)" {
                 message = advertisedLocalName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -219,7 +206,7 @@ struct ContentView: View {
     }
 
     private var isValidMessage: Bool {
-        !trimmedInput.isEmpty && trimmedInput.utf8.count <= 28
+        !trimmedInput.isEmpty && trimmedInput.utf8.count <= 8
     }
 
     private var needsUpdate: Bool {
@@ -245,6 +232,10 @@ struct ContentView: View {
                 .font(.title)
                 .padding(.top)
             
+            Text("Broadcast a message of up to 8 characters to all nearby devices:")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        
             HStack {
                 TextField("Message to broadcast", text: $inputText)
                     .textFieldStyle(.roundedBorder)
@@ -261,7 +252,7 @@ struct ContentView: View {
             .padding(.horizontal)
             
             if !bleManager.currentMessage.isEmpty {
-                Text("Broadcasting: \"\(bleManager.currentMessage)\"")
+                Text("Broadcast Message: \"\(bleManager.currentMessage)\"")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
